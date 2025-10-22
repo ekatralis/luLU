@@ -9,7 +9,12 @@ from cupy._core import _dtype
 from cupy.cuda import device as _device
 from cupy.cuda import stream as _stream
 from cupyx.cusparse import _dtype_to_IndexType, SpMatDescriptor, DnMatDescriptor, check_availability
-
+import scipy.sparse.linalg
+try:
+    import scipy.sparse.linalg
+    scipy_available = True
+except ImportError:
+    scipy_available = False
 class CachedAbSolver:
     
     def __init__(self, a, b, alpha=1.0, lower=True, unit_diag=False, transa=False):
@@ -83,7 +88,7 @@ class CachedAbSolver:
         else:
             raise ValueError('Unknown unit_diag (actual: {})'.format(unit_diag))
         self.diag_type = diag_type
-
+        self.transa = transa
         # Prepare op_a
         if transa == 'N':
             op_a = _cusparse.CUSPARSE_OPERATION_NON_TRANSPOSE
@@ -176,6 +181,9 @@ class CachedAbSolver:
         return op_b
     
     def solve(self, b):
+        assert b.dtype == self.dtype
+        assert self._get_opb(b) == self.op_b
+        
         if b.ndim == 1:
             is_b_vector = True
             b = b.reshape(-1, 1)
@@ -184,14 +192,17 @@ class CachedAbSolver:
         else:
             raise ValueError('b.ndim must be 1 or 2')
         self.is_b_vector = is_b_vector
+        
         c = _cupy.zeros(self.c_shape, dtype=self.dtype, order='f')
         mat_b = DnMatDescriptor.create(b)
         mat_c = DnMatDescriptor.create(c)
-        # Executes the solve phase
-        _cusparse.spSM_solve(
-            self.handle, self.op_a, self.op_b, self.alpha.data, self.mat_a.desc, mat_b.desc,
-            mat_c.desc, self.cuda_dtype, self.algo, self.spsm_descr, self.buff.data.ptr)
-
+        try:
+            # Executes the solve phase
+            _cusparse.spSM_solve(
+                self.handle, self.op_a, self.op_b, self.alpha.data, self.mat_a.desc, mat_b.desc,
+                mat_c.desc, self.cuda_dtype, self.algo, self.spsm_descr, self.buff.data.ptr)
+        finally:
+            _cupy.cuda.get_current_stream().synchronize()
         # Reshape back if B was a vector
         if self.is_b_vector:
             c = c.reshape(-1)
@@ -204,9 +215,87 @@ class CachedAbSolver:
 
 class luLU(SuperLU):
 
-    def __init__(self, obj, b_dtype = _cupy.float64):
-        super().__init__(obj)
-        self.b_dtype = b_dtype
-        b_sample = _cupy.ones(self.shape[0]*self.shape[1],dtype=self.b_dtype)
+    def __init__(self, A, trans = 'N', permc_spec=None, diag_pivot_thresh=None, relax=None,
+         panel_size=None, options={}):
+        if not check_availability('spsm'):
+            raise RuntimeError('spsm is not available.')
+        if not scipy_available:
+            raise RuntimeError('scipy is not available')
+        if not cupyx.scipy.sparse.isspmatrix(A):
+            raise TypeError('A must be cupyx.scipy.sparse.spmatrix')
+        if A.shape[0] != A.shape[1]:
+            raise ValueError('A must be a square matrix (A.shape: {})'
+                            .format(A.shape))
+        if A.dtype.char not in 'fdFD':
+            raise TypeError('Invalid dtype (actual: {})'.format(A.dtype))
 
+        a = A.get().tocsc()
+        a_slu = scipy.sparse.linalg.splu(
+            a, permc_spec=permc_spec, diag_pivot_thresh=diag_pivot_thresh,
+            relax=relax, panel_size=panel_size, options=options)
+        super().__init__(a_slu)
+        self.b_dtype = self.L.dtype
+        self._init_solvers(trans=trans)
+    
+    def _init_solvers(self,trans = 'N'):
+        b_sample = _cupy.ones(self.shape[0],dtype=self.b_dtype)
+        self.trans = trans
+        self.Lsolver = CachedAbSolver(self.L, b_sample, lower=True, transa=self.trans)
+        self.Usolver = CachedAbSolver(self.U, b_sample, lower=False, transa=self.trans)
+    
+    def solve(self, rhs, trans='N'):
+        """Solves linear system of equations with one or several right-hand sides.
+
+        Args:
+            rhs (cupy.ndarray): Right-hand side(s) of equation with dimension
+                ``(M)`` or ``(M, K)``.
+            trans (str): 'N', 'T' or 'H'.
+                'N': Solves ``A * x = rhs``.
+                'T': Solves ``A.T * x = rhs``.
+                'H': Solves ``A.conj().T * x = rhs``.
+
+        Returns:
+            cupy.ndarray:
+                Solution vector(s)
+        """  # NOQA
+        from cupyx import cusparse
+        if trans != self.trans:
+            raise AssertionError("Solve function assumes cached configuration. Rebuild cache by calling _init_solvers with desired configuration.")
+        if not isinstance(rhs, _cupy.ndarray):
+            raise TypeError('ojb must be cupy.ndarray')
+        if rhs.ndim not in (1, 2):
+            raise ValueError('rhs.ndim must be 1 or 2 (actual: {})'.
+                             format(rhs.ndim))
+        if rhs.shape[0] != self.shape[0]:
+            raise ValueError('shape mismatch (self.shape: {}, rhs.shape: {})'
+                             .format(self.shape, rhs.shape))
+        if trans not in ('N', 'T', 'H'):
+            raise ValueError('trans must be \'N\', \'T\', or \'H\'')
+
+        x = rhs.astype(self.L.dtype)
+        if trans == 'N':
+            if self.perm_r is not None:
+                if x.ndim == 2 and x._f_contiguous:
+                    x = x.T[:, self._perm_r_rev].T  # want to keep f-order
+                else:
+                    x = x[self._perm_r_rev]
+            x = self.Lsolver.solve(x)
+            x = self.Usolver.solve(x)
+            if self.perm_c is not None:
+                x = x[self.perm_c]
+        else:
+            if self.perm_c is not None:
+                if x.ndim == 2 and x._f_contiguous:
+                    x = x.T[:, self._perm_c_rev].T  # want to keep f-order
+                else:
+                    x = x[self._perm_c_rev]
+            x = self.Usolver.solve(x)
+            x = self.Lsolver.solve(x)
+            if self.perm_r is not None:
+                x = x[self.perm_r]
+
+        if not x._f_contiguous:
+            # For compatibility with SciPy
+            x = x.copy(order='F')
+        return x
     
