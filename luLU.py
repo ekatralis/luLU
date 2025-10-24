@@ -15,6 +15,8 @@ try:
     scipy_available = True
 except ImportError:
     scipy_available = False
+from line_profiler import profile
+
 class CachedAbSolver:
     
     def __init__(self, a, b, alpha=1.0, lower=True, unit_diag=False, transa=False):
@@ -164,8 +166,8 @@ class CachedAbSolver:
             _cusparse.spSM_analysis(
                 self.handle, self.op_a, self.op_b, self.alpha.data, self.mat_a.desc, mat_b.desc,
                 mat_c.desc, self.cuda_dtype, self.algo, self.spsm_descr, self.buff.data.ptr)
-        except:
-            raise RuntimeError('spSM_analysis failed.')
+        except Exception as e:
+            raise RuntimeError('spSM_analysis failed.') from e
     
     def _get_opb(self, b):
         # Prepare op_b
@@ -179,7 +181,7 @@ class CachedAbSolver:
         else:
             raise ValueError('b must be F-contiguous or C-contiguous.')
         return op_b
-    
+    @profile
     def solve(self, b):
         assert b.dtype == self.dtype
         assert self._get_opb(b) == self.op_b
@@ -242,7 +244,8 @@ class luLU(SuperLU):
         self.trans = trans
         self.Lsolver = CachedAbSolver(self.L, b_sample, lower=True, transa=self.trans)
         self.Usolver = CachedAbSolver(self.U, b_sample, lower=False, transa=self.trans)
-    
+        # self.Usolver = CachedAbSolver(self.U.T, b_sample, lower=True, transa="T") #Can improve performance at times
+    @profile
     def solve(self, rhs, trans='N'):
         """Solves linear system of equations with one or several right-hand sides.
 
